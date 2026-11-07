@@ -7,6 +7,7 @@ import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.View
+import com.example.fitlensartest.analysis.DistanceStatus
 
 class ShoulderOverlayView @JvmOverloads constructor(
     context: Context,
@@ -71,6 +72,7 @@ class ShoulderOverlayView @JvmOverloads constructor(
 
     private var hasPose = false
     private var isAligned = true
+    private var distanceStatus = DistanceStatus.OK
 
     fun updateBody(
         leftShoulderX: Float,
@@ -83,7 +85,8 @@ class ShoulderOverlayView @JvmOverloads constructor(
         rightHipY: Float,
         imageWidth: Int,
         imageHeight: Int,
-        isAligned: Boolean = true
+        isAligned: Boolean = true,
+        distanceStatus: DistanceStatus = DistanceStatus.OK
     ) {
         this.leftShoulderX = leftShoulderX
         this.leftShoulderY = leftShoulderY
@@ -98,6 +101,7 @@ class ShoulderOverlayView @JvmOverloads constructor(
         this.imageWidth = imageWidth
         this.imageHeight = imageHeight
         this.isAligned = isAligned
+        this.distanceStatus = distanceStatus
 
         hasPose = true
         postInvalidate()
@@ -108,7 +112,6 @@ class ShoulderOverlayView @JvmOverloads constructor(
         postInvalidate()
     }
 
-    // Map camera coordinates (normalized 0..1) to view coordinates with mirroring for front camera
     private fun mapX(x: Float, scale: Float, offsetX: Float): Float {
         return offsetX + (1f - x) * imageWidth * scale
     }
@@ -161,15 +164,15 @@ class ShoulderOverlayView @JvmOverloads constructor(
         canvas.drawLine(leftSX, leftSY, leftHX, leftHY, bodyLinePaint)
         canvas.drawLine(rightSX, rightSY, rightHX, rightHY, bodyLinePaint)
 
-        // Select paint based on body alignment status
-        val currentShoulderPaint = if (isAligned) shoulderPaintAligned else shoulderPaintWarning
-        val currentJointPaint = if (isAligned) jointPaintAligned else jointPaintWarning
+        // Select paint based on body alignment status & distance status
+        val currentShoulderPaint = if (isAligned && distanceStatus == DistanceStatus.OK) shoulderPaintAligned else shoulderPaintWarning
+        val currentJointPaint = if (isAligned && distanceStatus == DistanceStatus.OK) jointPaintAligned else jointPaintWarning
 
         // Draw Shoulder Measurement Line
         canvas.drawLine(leftSX, leftSY, rightSX, rightSY, currentShoulderPaint)
 
-        // Draw Chest Measurement Line (dashed)
-        if (isAligned) {
+        // Draw Chest Measurement Line
+        if (isAligned && distanceStatus == DistanceStatus.OK) {
             canvas.drawLine(leftChestX, leftChestY, rightChestX, rightChestY, chestPaintAligned)
             canvas.drawCircle(leftChestX, leftChestY, 12f, chestJointPaint)
             canvas.drawCircle(rightChestX, rightChestY, 12f, chestJointPaint)

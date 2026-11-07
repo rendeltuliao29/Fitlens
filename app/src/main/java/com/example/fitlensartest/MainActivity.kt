@@ -5,8 +5,11 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.os.Bundle
+import android.os.CountDownTimer
 import android.os.SystemClock
 import android.util.Log
+import android.view.View
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -14,21 +17,24 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
+import com.example.fitlensartest.analysis.DetectedOrientation
+import com.example.fitlensartest.analysis.DistanceStatus
+import com.example.fitlensartest.analysis.MeasurementEngine
+import com.example.fitlensartest.analysis.PoseOrientationDetector
+import com.example.fitlensartest.data.AppScanState
+import com.example.fitlensartest.data.Gender
+import com.example.fitlensartest.data.MeasurementResult
+import com.example.fitlensartest.data.PreferredFit
+import com.example.fitlensartest.data.UserInfo
 import com.example.fitlensartest.databinding.ActivityMainBinding
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
-import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import kotlin.math.abs
-import kotlin.math.asin
-import kotlin.math.cos
-import kotlin.math.roundToInt
-import kotlin.math.sqrt
 
 class MainActivity : AppCompatActivity() {
 
-    // Stores the dimensions of the image being processed
     @Volatile
     private var processedImageWidth = 0
 
@@ -38,29 +44,51 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private lateinit var cameraExecutor: ExecutorService
 
+    // Processing Helpers
     private var poseDetector: PoseDetector? = null
+    private var imageSegmenter: ImageSegmenterHelper? = null
+    private val orientationDetector = PoseOrientationDetector()
+    private val measurementEngine = MeasurementEngine()
 
-    // User height calibration (default: 175 cm / 5'9")
-    private var userHeightCm = 175
+    // State Tracking
+    private var currentState = AppScanState.USER_INPUT_FORM
+    private var currentUserInfo: UserInfo? = null
 
-    // Sliding window measurement histories for outlier rejection (Trimmed Mean)
-    private val shoulderHistory = ArrayDeque<Double>()
-    private val chestHistory = ArrayDeque<Double>()
-    private val maxHistorySize = 15
+    @Volatile
+    private var latestPersonMask: PersonMask? = null
 
-    // Smoothed measurement values (Exponential Moving Average)
-    private var smoothedShoulderWidthCm = 0.0
-    private var smoothedChestCircumferenceCm = 0.0
+    @Volatile
+    private var latestFrameBitmap: Bitmap? = null
 
-    // Camera permission request
+    @Volatile
+    private var latestPoseResult: PoseLandmarkerResult? = null
+
+    // Captured Scans
+    private var frontCapturedBitmap: Bitmap? = null
+    private var frontCapturedLandmarks: List<NormalizedLandmark>? = null
+    private var frontCapturedMask: PersonMask? = null
+
+    private var sideCapturedBitmap: Bitmap? = null
+    private var sideCapturedLandmarks: List<NormalizedLandmark>? = null
+    private var sideCapturedMask: PersonMask? = null
+
+    // Countdown Timer
+    private var countdownTimer: CountDownTimer? = null
+    private var isCountingDown = false
+
+    private var segmentationFrameCounter = 0
+
+    // Camera permission
     private val cameraPermission =
         registerForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { isGranted ->
             if (isGranted) {
-                startCamera()
+                if (currentState == AppScanState.FRONT_SCANNING || currentState == AppScanState.SIDE_SCANNING) {
+                    startCamera()
+                }
             } else {
-                binding.statusText.text = "Camera permission denied"
+                Toast.makeText(this, "Camera permission required for scanning", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -72,48 +100,403 @@ class MainActivity : AppCompatActivity() {
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        setupHeightCalibrationUI()
+        setupFormUI()
+        setupScanUI()
+        setupResultsUI()
+        updateUiForState(AppScanState.USER_INPUT_FORM)
+
         initPoseDetector()
+        initImageSegmenter()
+
         checkCameraPermission()
     }
 
-    private fun setupHeightCalibrationUI() {
-        updateHeightDisplay()
+    // ----------------------------------------------------
+    // FORM SETUP & VALIDATION
+    // ----------------------------------------------------
 
-        binding.btnHeightMinus.setOnClickListener {
-            if (userHeightCm > 120) {
-                userHeightCm -= 1
-                resetMeasurementHistory()
-                updateHeightDisplay()
+    private fun setupFormUI() {
+        binding.btnStartScan.setOnClickListener {
+            val ageText = binding.etAge.text.toString().trim()
+            val heightText = binding.etHeight.text.toString().trim()
+            val weightText = binding.etWeight.text.toString().trim()
+
+            if (ageText.isEmpty() || heightText.isEmpty() || weightText.isEmpty()) {
+                Toast.makeText(this, "Please complete all required fields (*)", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
             }
-        }
 
-        binding.btnHeightPlus.setOnClickListener {
-            if (userHeightCm < 230) {
-                userHeightCm += 1
-                resetMeasurementHistory()
-                updateHeightDisplay()
+            val age = ageText.toIntOrNull()
+            val height = heightText.toDoubleOrNull()
+            val weight = weightText.toDoubleOrNull()
+
+            if (age == null || age <= 0 || height == null || height <= 0.0 || weight == null || weight <= 0.0) {
+                Toast.makeText(this, "Please enter valid numeric values for Age, Height, and Weight", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            val gender = when (binding.rgGender.checkedRadioButtonId) {
+                R.id.rbGenderFemale -> Gender.FEMALE
+                R.id.rbGenderOther -> Gender.OTHER
+                else -> Gender.MALE
+            }
+
+            val preferredFit = when (binding.rgFit.checkedRadioButtonId) {
+                R.id.rbFitSlim -> PreferredFit.SLIM
+                R.id.rbFitOversized -> PreferredFit.OVERSIZED
+                else -> PreferredFit.REGULAR
+            }
+
+            val knownChest = binding.etKnownChest.text.toString().trim().toDoubleOrNull()
+            val usualShirt = binding.etShirtSize.text.toString().trim().ifEmpty { null }
+
+            currentUserInfo = UserInfo(
+                gender = gender,
+                age = age,
+                heightCm = height,
+                weightKg = weight,
+                preferredFit = preferredFit,
+                knownChestCircumferenceCm = knownChest,
+                usualShirtSize = usualShirt
+            )
+
+            // Reset scans and proceed to Front Scan
+            resetScanCaptures()
+            updateUiForState(AppScanState.FRONT_SCANNING)
+        }
+    }
+
+    private fun setupScanUI() {
+        // Instant Manual Capture Button
+        binding.btnManualCapture.setOnClickListener {
+            cancelCountdown()
+            if (currentState == AppScanState.FRONT_SCANNING) {
+                captureFrontScan()
+            } else if (currentState == AppScanState.SIDE_SCANNING) {
+                captureSideScan()
             }
         }
     }
 
-    private fun updateHeightDisplay() {
-        val totalInches = (userHeightCm / 2.54).roundToInt()
-        val feet = totalInches / 12
-        val inches = totalInches % 12
-        binding.userHeightText.text = String.format(
-            Locale.US, "%d cm (%d'%d\")", userHeightCm, feet, inches
+    private fun setupResultsUI() {
+        binding.btnRestartScan.setOnClickListener {
+            cancelCountdown()
+            resetScanCaptures()
+            updateUiForState(AppScanState.USER_INPUT_FORM)
+        }
+    }
+
+    private fun resetScanCaptures() {
+        frontCapturedBitmap = null
+        frontCapturedLandmarks = null
+        frontCapturedMask = null
+
+        sideCapturedBitmap = null
+        sideCapturedLandmarks = null
+        sideCapturedMask = null
+
+        orientationDetector.resetHistory()
+        cancelCountdown()
+    }
+
+    // ----------------------------------------------------
+    // STATE TRANSITION UI MANAGEMENT
+    // ----------------------------------------------------
+
+    private fun updateUiForState(newState: AppScanState) {
+        currentState = newState
+
+        binding.formScrollView.visibility = if (newState == AppScanState.USER_INPUT_FORM) View.VISIBLE else View.GONE
+        binding.cameraContainer.visibility = if (newState == AppScanState.FRONT_SCANNING || newState == AppScanState.SIDE_SCANNING) View.VISIBLE else View.GONE
+        binding.layoutAnalyzing.visibility = if (newState == AppScanState.ANALYZING) View.VISIBLE else View.GONE
+        binding.resultsScrollView.visibility = if (newState == AppScanState.RESULTS) View.VISIBLE else View.GONE
+
+        when (newState) {
+            AppScanState.USER_INPUT_FORM -> {
+                binding.shoulderOverlay.clear()
+            }
+            AppScanState.FRONT_SCANNING -> {
+                binding.statusText.text = "Front Scan — Face Camera"
+                binding.orientationPromptText.text = "Face camera straight at ~2.0m or tap 'Capture Scan Now'."
+                binding.stabilityProgressBar.progress = 0
+                binding.previewView.post {
+                    startCamera()
+                }
+            }
+            AppScanState.SIDE_SCANNING -> {
+                binding.statusText.text = "Side Scan — Turn Sideways"
+                binding.orientationPromptText.text = "Turn sideways to camera at ~2.0m or tap 'Capture Scan Now'."
+                binding.stabilityProgressBar.progress = 0
+                binding.previewView.post {
+                    startCamera()
+                }
+            }
+            AppScanState.ANALYZING -> {
+                performAnalysisInBackground()
+            }
+            AppScanState.RESULTS -> {
+                // UI populated after analysis finishes
+            }
+        }
+    }
+
+    // ----------------------------------------------------
+    // POSE & SCAN ANALYSIS LOOP
+    // ----------------------------------------------------
+
+    private fun onPoseDetected(result: PoseLandmarkerResult) {
+        latestPoseResult = result
+
+        if (currentState != AppScanState.FRONT_SCANNING && currentState != AppScanState.SIDE_SCANNING) {
+            return
+        }
+
+        val landmarks = result.landmarks().firstOrNull() ?: run {
+            runOnUiThread {
+                binding.shoulderOverlay.clear()
+                binding.statusText.text = "No body detected"
+                cancelCountdown()
+            }
+            return
+        }
+
+        val detectedOrientation = orientationDetector.detectOrientation(result)
+        val stability = orientationDetector.checkStability(result)
+        val distanceStatus = orientationDetector.checkDistanceStatus(result)
+
+        runOnUiThread {
+            if (landmarks.size > 24) {
+                val leftShoulder = landmarks[11]
+                val rightShoulder = landmarks[12]
+                val leftHip = landmarks[23]
+                val rightHip = landmarks[24]
+
+                binding.shoulderOverlay.updateBody(
+                    leftShoulderX = leftShoulder.x(),
+                    leftShoulderY = leftShoulder.y(),
+                    rightShoulderX = rightShoulder.x(),
+                    rightShoulderY = rightShoulder.y(),
+                    leftHipX = leftHip.x(),
+                    leftHipY = leftHip.y(),
+                    rightHipX = rightHip.x(),
+                    rightHipY = rightHip.y(),
+                    imageWidth = processedImageWidth,
+                    imageHeight = processedImageHeight,
+                    isAligned = (stability > 0.5f),
+                    distanceStatus = distanceStatus
+                )
+            }
+
+            binding.stabilityProgressBar.progress = (stability * 100).toInt()
+
+            if (distanceStatus == DistanceStatus.TOO_CLOSE) {
+                binding.statusText.text = "Step Back (Too Close)"
+                cancelCountdown()
+                return@runOnUiThread
+            } else if (distanceStatus == DistanceStatus.TOO_FAR) {
+                binding.statusText.text = "Step Closer (Too Far)"
+                cancelCountdown()
+                return@runOnUiThread
+            }
+
+            when (currentState) {
+                AppScanState.FRONT_SCANNING -> {
+                    if (detectedOrientation == DetectedOrientation.FRONT) {
+                        if (stability >= 0.65f) {
+                            binding.statusText.text = "Front Position Held — Capturing..."
+                            startCountdownTimer {
+                                captureFrontScan()
+                            }
+                        } else {
+                            binding.statusText.text = "Front Detected — Hold Still..."
+                            cancelCountdown()
+                        }
+                    } else {
+                        binding.statusText.text = "Please face straight toward the camera"
+                        cancelCountdown()
+                    }
+                }
+                AppScanState.SIDE_SCANNING -> {
+                    if (detectedOrientation == DetectedOrientation.SIDE) {
+                        if (stability >= 0.50f) {
+                            binding.statusText.text = "Side Position Held — Capturing..."
+                            startCountdownTimer {
+                                captureSideScan()
+                            }
+                        } else {
+                            binding.statusText.text = "Side Detected — Hold Still..."
+                            cancelCountdown()
+                        }
+                    } else {
+                        binding.statusText.text = "Please turn sideways to the camera"
+                        cancelCountdown()
+                    }
+                }
+                else -> {}
+            }
+        }
+    }
+
+    private fun startCountdownTimer(onFinish: () -> Unit) {
+        if (isCountingDown) return
+        isCountingDown = true
+
+        binding.countdownText.visibility = View.VISIBLE
+        binding.countdownText.text = "2"
+
+        countdownTimer?.cancel()
+        countdownTimer = object : CountDownTimer(2000, 1000) {
+            override fun onTick(millisUntilFinished: Long) {
+                val secondsLeft = (millisUntilFinished / 1000) + 1
+                binding.countdownText.text = secondsLeft.toString()
+            }
+
+            override fun onFinish() {
+                binding.countdownText.visibility = View.GONE
+                isCountingDown = false
+                onFinish()
+            }
+        }.start()
+    }
+
+    private fun cancelCountdown() {
+        if (isCountingDown) {
+            countdownTimer?.cancel()
+            isCountingDown = false
+            binding.countdownText.visibility = View.GONE
+        }
+    }
+
+    // ----------------------------------------------------
+    // AUTOMATIC SCAN CAPTURES
+    // ----------------------------------------------------
+
+    private fun captureFrontScan() {
+        val bitmap = latestFrameBitmap
+        val landmarks = latestPoseResult?.landmarks()?.firstOrNull()
+        val mask = latestPersonMask
+
+        if (bitmap == null || landmarks == null || mask == null) {
+            Toast.makeText(this, "Capture failed — retrying", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        frontCapturedBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, true)
+        frontCapturedLandmarks = landmarks
+        frontCapturedMask = mask
+
+        Toast.makeText(this, "Front scan captured!", Toast.LENGTH_SHORT).show()
+        orientationDetector.resetHistory()
+        updateUiForState(AppScanState.SIDE_SCANNING)
+    }
+
+    private fun captureSideScan() {
+        val bitmap = latestFrameBitmap
+        val landmarks = latestPoseResult?.landmarks()?.firstOrNull()
+        val mask = latestPersonMask
+
+        if (bitmap == null || landmarks == null || mask == null) {
+            Toast.makeText(this, "Capture failed — retrying", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        sideCapturedBitmap = bitmap.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, true)
+        sideCapturedLandmarks = landmarks
+        sideCapturedMask = mask
+
+        Toast.makeText(this, "Side scan captured!", Toast.LENGTH_SHORT).show()
+        updateUiForState(AppScanState.ANALYZING)
+    }
+
+    // ----------------------------------------------------
+    // BACKGROUND IMAGE ANALYSIS & RESULTS
+    // ----------------------------------------------------
+
+    private fun performAnalysisInBackground() {
+        val userInfo = currentUserInfo
+        val frontBmp = frontCapturedBitmap
+        val frontLms = frontCapturedLandmarks
+        val frontMsk = frontCapturedMask
+
+        val sideBmp = sideCapturedBitmap
+        val sideLms = sideCapturedLandmarks
+        val sideMsk = sideCapturedMask
+
+        if (userInfo == null || frontBmp == null || frontLms == null || frontMsk == null || sideBmp == null || sideLms == null || sideMsk == null) {
+            Toast.makeText(this, "Analysis failed: missing scan data", Toast.LENGTH_LONG).show()
+            updateUiForState(AppScanState.USER_INPUT_FORM)
+            return
+        }
+
+        cameraExecutor.execute {
+            try {
+                val result = measurementEngine.calculateMeasurements(
+                    userInfo = userInfo,
+                    frontBitmap = frontBmp,
+                    frontLandmarks = frontLms,
+                    frontMask = frontMsk,
+                    sideBitmap = sideBmp,
+                    sideLandmarks = sideLms,
+                    sideMask = sideMsk
+                )
+
+                runOnUiThread {
+                    displayFinalResults(userInfo, result)
+                    updateUiForState(AppScanState.RESULTS)
+                }
+
+            } catch (e: Exception) {
+                Log.e("FitLensAnalysis", "Error calculating measurements", e)
+                runOnUiThread {
+                    Toast.makeText(this, "Analysis error: ${e.message}", Toast.LENGTH_LONG).show()
+                    updateUiForState(AppScanState.USER_INPUT_FORM)
+                }
+            }
+        }
+    }
+
+    private fun displayFinalResults(userInfo: UserInfo, result: MeasurementResult) {
+        val swInches = result.shoulderWidthCm / 2.54
+        val cwInches = result.chestWidthCm / 2.54
+        val cdInches = result.chestDepthCm / 2.54
+        val ccInches = result.estimatedChestCircumferenceCm / 2.54
+
+        binding.tvResShoulderWidth.text = String.format(Locale.US, "%.1f cm (%.1f in)", result.shoulderWidthCm, swInches)
+        binding.tvResChestWidth.text = String.format(Locale.US, "%.1f cm (%.1f in)", result.chestWidthCm, cwInches)
+        binding.tvResChestDepth.text = String.format(Locale.US, "%.1f cm (%.1f in)", result.chestDepthCm, cdInches)
+        binding.tvResChestCircumference.text = String.format(Locale.US, "%.1f cm (%.1f in)", result.estimatedChestCircumferenceCm, ccInches)
+
+        // Known Chest Reference Validation Comparison
+        if (userInfo.knownChestCircumferenceCm != null && result.knownChestDifferenceCm != null) {
+            binding.cardValidation.visibility = View.VISIBLE
+            val knownCm = userInfo.knownChestCircumferenceCm
+            val diffCm = result.knownChestDifferenceCm
+            val pctDiff = (diffCm / knownCm) * 100.0
+
+            val sign = if (diffCm >= 0) "+" else ""
+            binding.tvResChestValidation.text = String.format(
+                Locale.US,
+                "Calculated: %.1f cm | User Reference: %.1f cm | Variance: %s%.1f cm (%s%.1f%%)",
+                result.estimatedChestCircumferenceCm, knownCm, sign, diffCm, sign, pctDiff
+            )
+        } else {
+            binding.cardValidation.visibility = View.GONE
+        }
+
+        // User Info Summary Card
+        val fitText = userInfo.preferredFit.name.lowercase().replaceFirstChar { it.uppercase() }
+        val shirtText = userInfo.usualShirtSize ?: "N/A"
+        binding.tvUserInfoSummary.text = String.format(
+            Locale.US,
+            "Gender: %s | Age: %d yrs | Height: %.0f cm | Weight: %.0f kg\nPreferred Fit: %s | Usual Shirt Size: %s",
+            userInfo.gender.name, userInfo.age, userInfo.heightCm, userInfo.weightKg, fitText, shirtText
         )
     }
 
-    private fun resetMeasurementHistory() {
-        shoulderHistory.clear()
-        chestHistory.clear()
-        smoothedShoulderWidthCm = 0.0
-        smoothedChestCircumferenceCm = 0.0
-    }
+    // ----------------------------------------------------
+    // INITIALIZATION & PROCESS SILHOUETTE
+    // ----------------------------------------------------
 
-    // Initialize MediaPipe
     private fun initPoseDetector() {
         try {
             poseDetector = PoseDetector(
@@ -127,206 +510,56 @@ class MainActivity : AppCompatActivity() {
             }
         } catch (e: Exception) {
             Log.e("FitLensPose", "MediaPipe initialization failed", e)
-            binding.statusText.text = "MediaPipe initialization failed"
         }
     }
 
-    // Handle detected body pose and estimate measurements with anatomical precision
-    private fun onPoseDetected(result: PoseLandmarkerResult) {
-        val landmarks = result.landmarks().firstOrNull()
-        val worldLandmarks = result.worldLandmarks().firstOrNull()
+    private fun initImageSegmenter() {
+        try {
+            imageSegmenter = ImageSegmenterHelper(this)
+        } catch (e: Exception) {
+            Log.e("FitLensSegmentation", "Image Segmenter initialization failed", e)
+        }
+    }
 
-        runOnUiThread {
-            if (landmarks != null && landmarks.size > 24 && worldLandmarks != null && worldLandmarks.size > 24) {
+    private fun processSilhouette(bitmap: Bitmap) {
+        try {
+            val segmenter = imageSegmenter ?: return
+            val personMask = segmenter.segmentImage(bitmap)
+            latestPersonMask = personMask
 
-                // Landmark visibility check (ensure key joints are not occluded)
-                val leftShoulderVis = landmarks[11].visibility().orElse(1.0f)
-                val rightShoulderVis = landmarks[12].visibility().orElse(1.0f)
-                val leftHipVis = landmarks[23].visibility().orElse(1.0f)
-                val rightHipVis = landmarks[24].visibility().orElse(1.0f)
+            val maskBitmap = SilhouetteProcessor.createBinaryMask(personMask, threshold = 0.5f)
 
-                if (leftShoulderVis < 0.6f || rightShoulderVis < 0.6f || leftHipVis < 0.5f || rightHipVis < 0.5f) {
-                    binding.statusText.text = "Body partially blocked — Stand in clear view"
-                    return@runOnUiThread
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) {
+                    binding.segmentationPreview.setImageBitmap(maskBitmap)
                 }
-
-                // Image space landmarks (0..1)
-                val leftShoulder = landmarks[11]
-                val rightShoulder = landmarks[12]
-                val leftHip = landmarks[23]
-                val rightHip = landmarks[24]
-
-                // 3D World space landmarks (in real-world meters)
-                val leftShoulderWorld = worldLandmarks[11]
-                val rightShoulderWorld = worldLandmarks[12]
-                val leftHipWorld = worldLandmarks[23]
-                val rightHipWorld = worldLandmarks[24]
-
-                // Calculate 3D Euclidean distance between acromion shoulder points (meters)
-                val dxS = (leftShoulderWorld.x() - rightShoulderWorld.x()).toDouble()
-                val dyS = (leftShoulderWorld.y() - rightShoulderWorld.y()).toDouble()
-                val dzS = (leftShoulderWorld.z() - rightShoulderWorld.z()).toDouble()
-
-                val rawAcromion3DMeters = sqrt(dxS * dxS + dyS * dyS + dzS * dzS)
-
-                // 3D Torso Height (midpoint of shoulders to midpoint of hips)
-                val midShoulderX = (leftShoulderWorld.x() + rightShoulderWorld.x()) / 2.0
-                val midShoulderY = (leftShoulderWorld.y() + rightShoulderWorld.y()) / 2.0
-                val midShoulderZ = (leftShoulderWorld.z() + rightShoulderWorld.z()) / 2.0
-
-                val midHipX = (leftHipWorld.x() + rightHipWorld.x()) / 2.0
-                val midHipY = (leftHipWorld.y() + rightHipWorld.y()) / 2.0
-                val midHipZ = (leftHipWorld.z() + rightHipWorld.z()) / 2.0
-
-                val dxT = midShoulderX - midHipX
-                val dyT = midShoulderY - midHipY
-                val dzT = midShoulderZ - midHipZ
-                val torsoHeightMeters = sqrt(dxT * dxT + dyT * dyT + dzT * dzT)
-
-                // Check body yaw rotation (angle of body turning relative to camera view)
-                val sinYaw = (abs(dzS) / (rawAcromion3DMeters + 1e-6)).coerceIn(0.0, 1.0)
-                val yawAngleDegrees = Math.toDegrees(asin(sinYaw))
-
-                if (yawAngleDegrees > 22.0) {
-                    binding.statusText.text = "Please face straight toward the camera"
-                    binding.shoulderOverlay.updateBody(
-                        leftShoulderX = leftShoulder.x(),
-                        leftShoulderY = leftShoulder.y(),
-                        rightShoulderX = rightShoulder.x(),
-                        rightShoulderY = rightShoulder.y(),
-                        leftHipX = leftHip.x(),
-                        leftHipY = leftHip.y(),
-                        rightHipX = rightHip.x(),
-                        rightHipY = rightHip.y(),
-                        imageWidth = processedImageWidth,
-                        imageHeight = processedImageHeight,
-                        isAligned = false
-                    )
-                    return@runOnUiThread
-                }
-
-                // Apply trigonometric yaw correction for minor body turns
-                val yawCorrectionFactor = 1.0 / cos(Math.toRadians(yawAngleDegrees)).coerceAtLeast(0.85)
-                val correctedAcromionMeters = rawAcromion3DMeters * yawCorrectionFactor
-
-                // Height Scale Factor relative to standard reference model
-                val heightScaleFactor = userHeightCm / 170.0
-
-                // Outer Bideltoid Shoulder Width Calibration:
-                // MediaPipe measures inner acromion distance; outer bideltoid breadth incorporates deltoid muscle thickness (~1.30 anatomical ratio)
-                val rawShoulderWidthCm = correctedAcromionMeters * 100.0 * 1.30 * heightScaleFactor
-
-                // Dynamic chest depth ratio based on Torso Aspect Ratio (torsoHeight / shoulderWidth)
-                val torsoAspectRatio = torsoHeightMeters / (correctedAcromionMeters + 1e-6)
-                val chestDepthRatio = when {
-                    torsoAspectRatio > 1.25 -> 0.62 // Slender frame
-                    torsoAspectRatio < 1.05 -> 0.72 // Broad frame
-                    else -> 0.67 // Standard frame
-                }
-
-                // Pectoral & Latissimus Anatomical Model:
-                // Chest Circumference C ~ 2.22 * Bideltoid Shoulder Width
-                val chestWidthCm = rawShoulderWidthCm * 0.94
-                val chestDepthCm = chestWidthCm * chestDepthRatio
-
-                val a = chestWidthCm / 2.0
-                val b = chestDepthCm / 2.0
-                val h = ((a - b) * (a - b)) / ((a + b) * (a + b))
-
-                // Ramanujan's approximation for perimeter of an ellipse
-                val rawChestCircumferenceCm = Math.PI * (a + b) * (1.0 + (3.0 * h) / (10.0 + sqrt(4.0 - 3.0 * h)))
-
-                // Add sample to sliding window
-                shoulderHistory.addLast(rawShoulderWidthCm)
-                if (shoulderHistory.size > maxHistorySize) shoulderHistory.removeFirst()
-
-                chestHistory.addLast(rawChestCircumferenceCm)
-                if (chestHistory.size > maxHistorySize) chestHistory.removeFirst()
-
-                // Calculate Trimmed Mean (discard outliers for high stability)
-                val medianShoulder = calculateTrimmedMean(shoulderHistory)
-                val medianChest = calculateTrimmedMean(chestHistory)
-
-                // Exponential Moving Average filter
-                if (smoothedShoulderWidthCm == 0.0) {
-                    smoothedShoulderWidthCm = medianShoulder
-                    smoothedChestCircumferenceCm = medianChest
-                } else {
-                    val alpha = 0.15
-                    smoothedShoulderWidthCm += alpha * (medianShoulder - smoothedShoulderWidthCm)
-                    smoothedChestCircumferenceCm += alpha * (medianChest - smoothedChestCircumferenceCm)
-                }
-
-                val shoulderInches = smoothedShoulderWidthCm / 2.54
-                val chestInches = smoothedChestCircumferenceCm / 2.54
-
-                // Update overlay lines and landmark positions
-                binding.shoulderOverlay.updateBody(
-                    leftShoulderX = leftShoulder.x(),
-                    leftShoulderY = leftShoulder.y(),
-                    rightShoulderX = rightShoulder.x(),
-                    rightShoulderY = rightShoulder.y(),
-                    leftHipX = leftHip.x(),
-                    leftHipY = leftHip.y(),
-                    rightHipX = rightHip.x(),
-                    rightHipY = rightHip.y(),
-                    imageWidth = processedImageWidth,
-                    imageHeight = processedImageHeight,
-                    isAligned = true
-                )
-
-                // Update HUD display
-                binding.statusText.text = "Body Aligned — Measuring"
-                binding.shoulderWidthText.text = String.format(
-                    Locale.US, "%.1f cm (%.1f in)", smoothedShoulderWidthCm, shoulderInches
-                )
-                binding.chestCircumferenceText.text = String.format(
-                    Locale.US, "%.1f cm (%.1f in)", smoothedChestCircumferenceCm, chestInches
-                )
-
-            } else {
-                shoulderHistory.clear()
-                chestHistory.clear()
-                smoothedShoulderWidthCm = 0.0
-                smoothedChestCircumferenceCm = 0.0
-
-                binding.shoulderOverlay.clear()
-                binding.statusText.text = "No body detected"
-                binding.shoulderWidthText.text = "-- cm"
-                binding.chestCircumferenceText.text = "-- cm"
             }
+        } catch (e: Exception) {
+            Log.e("FitLensSegmentation", "Segmentation failed", e)
         }
     }
 
-    // Trims top 20% and bottom 20% outliers to prevent measurement spikes
-    private fun calculateTrimmedMean(history: Collection<Double>): Double {
-        if (history.isEmpty()) return 0.0
-        val sorted = history.sorted()
-        if (sorted.size < 5) return sorted.average()
-        val trimCount = sorted.size / 5
-        val trimmed = sorted.subList(trimCount, sorted.size - trimCount)
-        return trimmed.average()
-    }
+    // ----------------------------------------------------
+    // CAMERA SETUP & FRAME ANALYSIS
+    // ----------------------------------------------------
 
-    // Check camera permission
     private fun checkCameraPermission() {
-        val permissionGranted =
-            ContextCompat.checkSelfPermission(
-                this,
-                Manifest.permission.CAMERA
-            ) == PackageManager.PERMISSION_GRANTED
+        val permissionGranted = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.CAMERA
+        ) == PackageManager.PERMISSION_GRANTED
 
         if (permissionGranted) {
-            startCamera()
+            if (currentState == AppScanState.FRONT_SCANNING || currentState == AppScanState.SIDE_SCANNING) {
+                startCamera()
+            }
         } else {
             cameraPermission.launch(Manifest.permission.CAMERA)
         }
     }
 
-    // Start CameraX
     private fun startCamera() {
-        val cameraProviderFuture =
-            ProcessCameraProvider.getInstance(this)
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
         cameraProviderFuture.addListener({
             try {
@@ -338,30 +571,20 @@ class MainActivity : AppCompatActivity() {
                     return@addListener
                 }
 
-                // Camera preview
                 val preview = Preview.Builder()
                     .build()
                     .also {
                         it.surfaceProvider = binding.previewView.surfaceProvider
                     }
 
-                // Camera frame analysis
                 val imageAnalysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(
-                        ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST
-                    )
-                    .setOutputImageFormat(
-                        ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888
-                    )
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .build()
 
-                // Process camera frames
                 imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
                     try {
-                        // Convert camera frame to Bitmap
                         val bitmap = imageProxy.toBitmap()
-
-                        // Rotate image according to camera orientation
                         val rotationDegrees = imageProxy.imageInfo.rotationDegrees
 
                         val matrix = Matrix().apply {
@@ -369,27 +592,20 @@ class MainActivity : AppCompatActivity() {
                         }
 
                         val rotatedBitmap = Bitmap.createBitmap(
-                            bitmap,
-                            0,
-                            0,
-                            bitmap.width,
-                            bitmap.height,
-                            matrix,
-                            true
+                            bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true
                         )
 
-                        // Save image dimensions for shoulder overlay
                         processedImageWidth = rotatedBitmap.width
                         processedImageHeight = rotatedBitmap.height
+                        latestFrameBitmap = rotatedBitmap
 
-                        // Strictly monotonic timestamp in milliseconds
+                        segmentationFrameCounter++
+                        if (segmentationFrameCounter % 2 == 0) {
+                            processSilhouette(rotatedBitmap)
+                        }
+
                         val timestampMs = SystemClock.uptimeMillis()
-
-                        // Detect body landmarks asynchronously
-                        poseDetector?.detect(
-                            rotatedBitmap,
-                            timestampMs
-                        )
+                        poseDetector?.detect(rotatedBitmap, timestampMs)
 
                     } catch (e: Exception) {
                         Log.e("FitLensCamera", "Frame processing failed", e)
@@ -398,10 +614,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // Remove previous camera connections
                 cameraProvider.unbindAll()
-
-                // Connect camera
                 cameraProvider.bindToLifecycle(
                     this,
                     cameraSelector,
@@ -409,21 +622,25 @@ class MainActivity : AppCompatActivity() {
                     imageAnalysis
                 )
 
-                binding.statusText.text = "Camera running — detecting body..."
-
             } catch (e: Exception) {
                 Log.e("FitLensCamera", "Camera setup failed", e)
-                binding.statusText.text = "Camera failed to start"
             }
 
         }, ContextCompat.getMainExecutor(this))
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        cancelCountdown()
         poseDetector?.close()
+        poseDetector = null
+
+        imageSegmenter?.close()
+        imageSegmenter = null
+
         if (::cameraExecutor.isInitialized) {
             cameraExecutor.shutdown()
         }
+
+        super.onDestroy()
     }
 }
